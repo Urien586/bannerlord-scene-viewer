@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bannerlord Scene Viewer</title>
+<style>
+  :root { --bg:#16181c; --panel:#1f2228; --line:#333842; --text:#d8dce3; --dim:#8a919c; --acc:#f5c542; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:13px/1.4 system-ui, sans-serif; }
+  #app { display:flex; height:100%; }
+  #side { width:300px; flex:none; background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; overflow:hidden; }
+  #side section { padding:10px 12px; border-bottom:1px solid var(--line); }
+  #side h2 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin:0 0 6px; }
+  #side .scroll { overflow:auto; flex:1; min-height:80px; }
+  .row { padding:3px 6px; cursor:pointer; border-radius:3px; display:flex; gap:6px; align-items:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row:hover, .row.sel { background:#2c313a; }
+  .sw { width:10px; height:10px; border-radius:2px; flex:none; }
+  .num { margin-left:auto; color:var(--dim); }
+  input[type=search] { width:100%; padding:5px 7px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px; }
+  label.pick { display:block; padding:8px; text-align:center; border:1px dashed var(--line); border-radius:4px; cursor:pointer; }
+  label.pick:hover { border-color:var(--acc); }
+  #main { flex:1; position:relative; overflow:hidden; }
+  canvas { position:absolute; inset:0; display:block; width:100%; height:100%; }
+  #cv { cursor:grab; }
+  #cv.drag { cursor:grabbing; }
+  #tip { position:absolute; pointer-events:none; background:#000c; padding:4px 7px; border-radius:4px; white-space:pre; display:none; font-size:12px; }
+  #drop { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; color:var(--dim); font-size:16px; text-align:center; pointer-events:none; }
+  #main.over { outline:3px dashed var(--acc); outline-offset:-3px; }
+  #info { white-space:pre-wrap; font-family:ui-monospace, monospace; font-size:12px; max-height:180px; overflow:auto; }
+  .muted { color:var(--dim); }
+  #status.err { color:#ff6b6b; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <section>
+      <label class="pick">Open scene folder…<input id="dir" type="file" webkitdirectory multiple hidden></label>
+      <div id="status" class="muted" style="margin-top:6px">Pick or drop a SceneObj/&lt;scene&gt; folder.</div>
+    </section>
+    <section>
+      <h2>Entities</h2>
+      <input id="q" type="search" placeholder="Search name / prefab…">
+      <div style="margin-top:6px"><label><input id="showEnt" type="checkbox" checked> show entities</label> <span id="entCount" class="muted"></span></div>
+      <div id="cats" style="margin-top:4px;display:flex;flex-wrap:wrap;gap:2px 10px"></div>
+      <div id="hits" class="scroll" style="max-height:160px;margin-top:4px"></div>
+    </section>
+    <section><h2>Selection</h2><div id="info" class="muted">Click a navmesh face.</div></section>
+    <section style="border:0;padding-bottom:4px"><h2>Navmesh <span id="islCount"></span></h2>
+      <label title="green/coloured see-through overlay"><input id="showNav" type="checkbox" checked> <b>show navmesh</b></label><br> <label><input type="radio" name="mode" value="terrain" checked> map colours</label> <label><input type="radio" name="mode" value="islands"> islands</label></section>
+    <div id="islands" class="scroll" style="padding:0 12px 10px"></div>
+  </div>
+  <div id="main">
+    <canvas id="gl"></canvas>
+    <canvas id="cv"></canvas>
+    <div id="drop">Drop a scene folder here<br><span style="font-size:13px">(reads scene.xscene, navmesh.bin and terrain.bin)</span></div>
+    <div id="tip"></div>
+  </div>
+</div>
+<script>
+'use strict';
+// ---------- navmesh.bin (RNM1 container, NMG9 body); format notes in FORMATS.md ----------
+function lz4Block(src, i, out) {
+  let o = 0;
+  while (i < src.length) {
+    const t = src[i++];
+    let lit = t >> 4;
+    if (lit === 15) { let x; do { x = src[i++]; lit += x; } while (x === 255); }
+    out.set(src.subarray(i, i + lit), o); i += lit; o += lit;
+    if (i >= src.length) break;
+    const off = src[i] | (src[i + 1] << 8); i += 2;
+    let len = t & 15;
+    if (len === 15) { let x; do { x = src[i++]; len += x; } while (x === 255); }
+    len += 4;
+    if (off === 0 || off > o) throw new Error('LZ4 corrupt at ' + i);
+    for (let k = 0; k < len; k++, o++) out[o] = out[o - off];
+  }
+  return o;
+}
+const tag = (u8, o) => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+
+function parseNavmesh(buf) {
+  const file = new Uint8Array(buf), fdv = new DataView(buf);
+  if (tag(file, 0) !== 'RNM1') throw new Error('navmesh.bin: not RNM1');
+  const rawLen = Number(fdv.getBigUint64(16, true));
+  const raw = new Uint8Array(rawLen);
+  if (lz4Block(file, 48, raw) !== rawLen) throw new Error('navmesh.bin: size mismatch after LZ4');
+  if (tag(raw, 0) !== 'NMG9') throw new Error('navmesh.bin: not NMG9');
+  const d = new DataView(raw.buffer);
+  let o = 4;
+  const nv = d.getUint32(o, true); o += 4;
+  const verts = new Float32Array(nv * 3);
+  for (let i = 0; i < nv * 3; i++, o += 4) verts[i] = d.getFloat32(o, true);
+  const ne = d.getUint32(o, true); o += 4 + ne * 24; // edges: only the count is needed
+  const nf = d.getUint32(o, true); o += 4;
+  const faces = new Array(nf);
+  for (let i = 0; i < nf; i++) {
+    const n = d.getUint32(o, true); o += 4;
+    const v = [], e = [];
+    for (let k = 0; k < n; k++, o += 4) v.push(d.getUint32(o, true));
+    for (let k = 0; k < n; k++, o += 4) e.push(d.getUint32(o, true));
+    faces[i] = { v, e, b: d.getInt32(o + 4, true), id: d.getInt32(o + 8, true), flags: d.getInt32(o + 16, true), d: raw[o + 20] };
+    o += 21;
+  }
+  return { verts, ne, faces };
+}
+
+// Faces sharing an edge index are neighbours -> union-find islands, largest first.
+function findIslands(m) {
+  const par = new Int32Array(m.faces.length).map((_, i) => i);
+  const root = x => { while (par[x] !== x) x = par[x] = par[par[x]]; return x; };
+  const owner = new Int32Array(m.ne).fill(-1);
+  m.faces.forEach((f, i) => f.e.forEach(e => {
+    if (e >= m.ne) return;
+    if (owner[e] < 0) owner[e] = i; else par[root(i)] = root(owner[e]);
+  }));
+  const map = new Map();
+  m.faces.forEach((f, i) => { const r = root(i); if (!map.has(r)) map.set(r, []); map.get(r).push(i); });
+  const isl = [...map.values()].sort((a, b) => b.length - a.length).map(faces => ({ faces }));
+  isl.forEach((s, k) => s.faces.forEach(i => m.faces[i].island = k));
+  return isl;
+}
+
+// ---------- scene.xscene entities ----------
+// Mat = [3x3 rotation*scale columns..., tx,ty,tz]; euler applied as yaw(z), pitch(x), roll(y) like TaleWorlds Mat3.ApplyEulerAngles.
+function localMat(tr) {
+  const p = (tr?.getAttribute('position') || '0,0,0').split(',').map(Number);
+  const r = (tr?.getAttribute('rotation_euler') || '0,0,0').split(',').map(Number);
+  const s = (tr?.getAttribute('scale') || '1,1,1').split(',').map(Number);
+  const [cx, sx] = [Math.cos(r[0]), Math.sin(r[0])], [cy, sy] = [Math.cos(r[1]), Math.sin(r[1])], [cz, sz] = [Math.cos(r[2]), Math.sin(r[2])];
+  const Rz = [cz, sz, 0, -sz, cz, 0, 0, 0, 1], Rx = [1, 0, 0, 0, cx, sx, 0, -sx, cx], Ry = [cy, 0, -sy, 0, 1, 0, sy, 0, cy];
+  const R = mul3(mul3(Rz, Rx), Ry);
+  for (let c = 0; c < 3; c++) for (let k = 0; k < 3; k++) R[c * 3 + k] *= s[c];
+  return [...R, p[0], p[1], p[2]];
+}
+function mul3(a, b) { // column-major 3x3
+  const r = new Array(9);
+  for (let c = 0; c < 3; c++) for (let k = 0; k < 3; k++) r[c * 3 + k] = a[k] * b[c * 3] + a[3 + k] * b[c * 3 + 1] + a[6 + k] * b[c * 3 + 2];
+  return r;
+}
+function mulMat(a, b) {
+  const R = mul3(a, b);
+  const t = [0, 1, 2].map(k => a[k] * b[9] + a[3 + k] * b[10] + a[6 + k] * b[11] + a[9 + k]);
+  return [...R, ...t];
+}
+function parseScene(text) {
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  if (doc.querySelector('parsererror')) throw new Error('scene.xscene: XML parse error');
+  const out = [], water = [];
+  const walk = (parent, M, path) => {
+    for (const el of parent.children) {
+      if (el.tagName !== 'game_entity') continue;
+      const tr = [...el.children].find(c => c.tagName === 'transform');
+      const W = mulMat(M, localMat(tr));
+      const name = el.getAttribute('name') || '', prefab = el.getAttribute('prefab') || el.getAttribute('old_prefab_name') || '';
+      const label = name || prefab;
+      // _index_-only entries are overrides of a prefab's own children, not separate entities
+      if (label && tr) out.push({ name, prefab, label, path, x: W[9], y: W[10], z: W[11], key: (name + ' ' + prefab).toLowerCase() });
+      // water plane: a plane mesh with a water material on this entity (e.g. Cappa3's "fakewater", 10000x scaled at 63.4 m)
+      const comps = [...el.children].find(c => c.tagName === 'components');
+      if (comps && [...comps.getElementsByTagName('mesh')].some(m => /plane/i.test(m.getAttribute('name') || '') && /water|river|lake|sea|ocean|swamp|pond/i.test(m.getAttribute('material') || '')))
+        // limitation: editor_plane assumed 2 m wide (-1..1) before scaling; real size is in the mesh package
+        water.push({ z: W[11], c: [W[9], W[10]], a: [W[0], W[1]], b: [W[3], W[4]] });
+      const ch = [...el.children].find(c => c.tagName === 'children');
+      if (ch) walk(ch, W, path ? path + ' / ' + (label || '?') : (label || '?'));
+    }
+  };
+  const ents = [...doc.documentElement.children].find(c => c.tagName === 'entities');
+  if (ents) walk(ents, [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], '');
+  out.terrainEl = [...doc.documentElement.children].find(c => c.tagName === 'terrain');
+  const prop = n => doc.querySelector(`environment_properties > property[name="${n}"]`)?.getAttribute('value');
+  if (prop('water_exists') === 'true') water.push({ z: +prop('water_level'), global: true });
+  out.water = water;
+  return out;
+}
+
+// ---------- terrain.bin ("ZGR6RTRN"): MIDX/HGHT/NRML/WGHT/PHYM parts, each = per-node u32 offset table + 40-byte header + LZ4 block ----------
+// HGHT node = u32 len + 16-bit gray PNG (129x129). WGHT node = 16 x (u32 present [+ u32 len + 8-bit gray PNG]). PNG row = world y, column = world x.
+function terrainParts(buf) {
+  const u8 = new Uint8Array(buf), dv = new DataView(buf);
+  if (String.fromCharCode(...u8.subarray(0, 8)) !== 'ZGR6RTRN') throw new Error('terrain.bin: not ZGR6RTRN');
+  const parts = {};
+  for (let o = 12; o + 20 <= 0x70; o += 20) {
+    const tag = String.fromCharCode(...u8.subarray(o, o + 4)), off = dv.getUint32(o + 8, true), raw = dv.getUint32(o + 16, true);
+    let h = off; // the container header (u64 3, u64 raw size) follows the node offset table
+    while (!(dv.getUint32(h, true) === 3 && dv.getUint32(h + 4, true) === 0 && dv.getUint32(h + 8, true) === raw)) h += 4;
+    parts[tag] = { off, h, raw, comp: dv.getUint32(h + 16, true) };
+  }
+  return parts;
+}
+function terrainPart(buf, p) {
+  const u8 = new Uint8Array(buf), dv = new DataView(buf);
+  const offs = []; for (let o = p.off; o < p.h; o += 4) offs.push(dv.getUint32(o, true));
+  const raw = new Uint8Array(p.raw);
+  if (lz4Block(u8.subarray(0, p.h + p.comp), p.h + 40, raw) !== p.raw) throw new Error('terrain.bin: LZ4 size mismatch');
+  return { offs, raw };
+}
+// Minimal PNG decoder: 8/16-bit gray, non-interlaced (what terrain.bin stores). inflate(Uint8Array) -> Promise<Uint8Array>.
+async function decodePng(png, inflate) {
+  const dv = new DataView(png.buffer, png.byteOffset, png.byteLength);
+  const w = dv.getUint32(16), h = dv.getUint32(20), depth = png[24], type = png[25];
+  if (type !== 0 || (depth !== 8 && depth !== 16) || png[28]) throw new Error(`PNG type ${type}/${depth} not supported`);
+  const idat = [];
+  for (let o = 8; o < png.length;) { const len = dv.getUint32(o), t = String.fromCharCode(...png.subarray(o + 4, o + 8)); if (t === 'IDAT') idat.push(png.subarray(o + 8, o + 8 + len)); o += 12 + len; }
+  const z = new Uint8Array(idat.reduce((a, c) => a + c.length, 0)); let k = 0; for (const c of idat) { z.set(c, k); k += c.length; }
+  const data = await inflate(z), bpp = depth / 8, stride = w * bpp, out = new Uint8Array(h * stride);
+  for (let y = 0; y < h; y++) {
+    const f = data[y * (stride + 1)], src = data.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)), row = y * stride;
+    for (let x = 0; x < stride; x++) {
+      const a = x >= bpp ? out[row + x - bpp] : 0, b = y ? out[row - stride + x] : 0, c = x >= bpp && y ? out[row - stride + x - bpp] : 0;
+      let v = src[x];
+      if (f === 1) v += a; else if (f === 2) v += b; else if (f === 3) v += (a + b) >> 1;
+      else if (f === 4) { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c; }
+      out[row + x] = v;
+    }
+  }
+  return depth === 16 ? { w, h, v: Uint16Array.from({ length: w * h }, (_, i) => (out[i * 2] << 8) | out[i * 2 + 1]), max: 65535 } : { w, h, v: out, max: 255 };
+}
+// Ground colour per layer from its diffuse texture name. limitation: guessed from the name, not the real texture; could be improved by sampling the texture's smallest mip from .tpac when packages are picked.
+const GROUND = [[/snow|ice/, [228, 232, 236]], [/road|cobble|path|pave/, [150, 138, 118]], [/mud/, [92, 74, 52]], [/cliff|rock|stone|gravel|pebble/, [128, 122, 112]],
+  [/desert|sand|beach|dune/, [196, 170, 124]], [/soil|dirt|earth|ground_b|farm|field/, [128, 100, 68]], [/grass|flora|forest|moss|meadow|green/, [92, 120, 58]], [/water|river/, [70, 100, 120]]];
+const groundColor = name => (GROUND.find(([re]) => re.test(name)) || [0, [140, 130, 110]])[1];
+
+// Builds an RGBA top-down image of the terrain: layer colours blended in layer order by weight, hillshaded from the heights.
+async function buildTerrain(buf, terrainEl, inflate, water = []) {
+  const nx = +terrainEl.getAttribute('node_dimension_x'), ny = +terrainEl.getAttribute('node_dimension_y'), size = +terrainEl.getAttribute('node_size');
+  const hmin = +terrainEl.getAttribute('min_height'), hmax = +terrainEl.getAttribute('max_height');
+  const layers = [...terrainEl.querySelectorAll('layers > layer')].map(l => {
+    const d = l.querySelector('summer texture[type=diffusemap]') || l.querySelector('texture[type=diffusemap]');
+    return { name: l.getAttribute('name'), tex: d?.getAttribute('name') || '', color: groundColor(((d?.getAttribute('name') || '') + ' ' + l.getAttribute('name')).toLowerCase()) };
+  });
+  const parts = terrainParts(buf), H = terrainPart(buf, parts.HGHT), Wt = terrainPart(buf, parts.WGHT);
+  if (H.offs.length !== nx * ny) throw new Error(`terrain.bin: ${H.offs.length} nodes, scene says ${nx}x${ny}`);
+  let res = 0;
+  const W = () => nx * (res - 1) + 1, Hh = () => ny * (res - 1) + 1;
+  let height, rgb;
+  for (let n = 0; n < nx * ny; n++) {
+    const iy = Math.floor(n / nx), ix = n % nx; // node order: y outer, x inner (checked against navmesh heights)
+    const hdv = new DataView(H.raw.buffer, H.offs[n]), hp = await decodePng(H.raw.subarray(H.offs[n] + 4, H.offs[n] + 4 + hdv.getUint32(0, true)), inflate);
+    if (!res) { res = hp.w; height = new Float32Array(W() * Hh()); rgb = new Float32Array(W() * Hh() * 3); }
+    const base = layers[0]?.color || [140, 130, 110];
+    const node = new Float32Array(res * res * 3); for (let i = 0; i < res * res; i++) node.set(base, i * 3);
+    let o = Wt.offs[n];
+    const wdv = new DataView(Wt.raw.buffer);
+    for (let l = 0; l < 16; l++) {
+      const present = wdv.getUint32(o, true); o += 4;
+      if (!present) continue;
+      const len = wdv.getUint32(o, true), wp = await decodePng(Wt.raw.subarray(o + 4, o + 4 + len), inflate); o += 4 + len;
+      if (!l || !layers[l]) continue;
+      const c = layers[l].color;
+      for (let i = 0; i < res * res; i++) { const a = wp.v[i] / 255; if (a) for (let j = 0; j < 3; j++) node[i * 3 + j] += (c[j] - node[i * 3 + j]) * a; }
+    }
+    for (let r = 0; r < res; r++) for (let c = 0; c < res; c++) {
+      const gx = ix * (res - 1) + c, gy = iy * (res - 1) + r, g = gy * W() + gx, i = r * res + c;
+      height[g] = hmin + hp.v[i] / hp.max * (hmax - hmin);
+      rgb.set(node.subarray(i * 3, i * 3 + 3), g * 3);
+    }
+  }
+  // hillshade (light from north-west, high) into an RGBA image; image row 0 = north (max y)
+  const w = W(), h = Hh(), step = size / (res - 1), img = new Uint8ClampedArray(w * h * 4);
+  for (const wt of water) if (!wt.global) { wt.ia = 1 / (wt.a[0] ** 2 + wt.a[1] ** 2); wt.ib = 1 / (wt.b[0] ** 2 + wt.b[1] ** 2); }
+  for (let gy = 0; gy < h; gy++) for (let gx = 0; gx < w; gx++) {
+    const g = gy * w + gx, hx = height[gy * w + Math.min(w - 1, gx + 1)] - height[gy * w + Math.max(0, gx - 1)], hy = height[Math.min(h - 1, gy + 1) * w + gx] - height[Math.max(0, gy - 1) * w + gx];
+    let nxv = -hx / (2 * step), nyv = -hy / (2 * step); const nl = Math.hypot(nxv, nyv, 1);
+    const shade = 0.55 + 0.6 * Math.max(0, (nxv * -0.45 + nyv * 0.45 + 0.77) / nl);
+    const p = ((h - 1 - gy) * w + gx) * 4;
+    img[p] = rgb[g * 3] * shade; img[p + 1] = rgb[g * 3 + 1] * shade; img[p + 2] = rgb[g * 3 + 2] * shade; img[p + 3] = 255;
+    // ground under a water plane (or the global water level) is painted as water, darker where deeper
+    const x = gx * step, y = gy * step, hg = height[g];
+    let wz = -Infinity;
+    for (const wt of water) if (hg < wt.z && wt.z > wz && (wt.global || (Math.abs(((x - wt.c[0]) * wt.a[0] + (y - wt.c[1]) * wt.a[1]) * wt.ia) <= 1 && Math.abs(((x - wt.c[0]) * wt.b[0] + (y - wt.c[1]) * wt.b[1]) * wt.ib) <= 1))) wz = wt.z;
+    if (wz > -Infinity) { const k = Math.min(1, (wz - hg) / 12); img[p] = 88 - 58 * k; img[p + 1] = 150 - 75 * k; img[p + 2] = 190 - 60 * k; }
+  }
+  return { w, h, img, step, extent: [0, 0, nx * size, ny * size], height, layers, hmin, hmax };
+}
+
+// ---------- state + rendering ----------
+// Navmesh is drawn with WebGL (Canvas2D paths stall on 200k+ faces); entities and markers on a 2D overlay.
+const S = { nav: null, islands: [], ents: [], matches: null, selIsland: -1, selFaces: [], view: { cx: 0, cy: 0, s: 1 }, dirty: false, mode: 'terrain' };
+const SMALL = 50; // islands below this many faces get a red ring so they stand out when zoomed out
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d'), glc = $('gl');
+const gl = glc.getContext('webgl', { antialias: true });
+const hue = k => (170 + k * 137.508) % 360; // two largest islands teal/magenta; red is kept for small-island rings
+
+const G = (() => {
+  if (!gl) return null;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  const p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, `attribute vec3 pos; attribute vec3 col; uniform vec4 view; uniform vec2 zr; varying vec3 c;
+    void main(){ c = col; gl_Position = vec4(pos.x*view.x+view.z, pos.y*view.y+view.w, 1.0-2.0*(pos.z-zr.x)/zr.y, 1.0); }`));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, `precision mediump float; uniform float alpha; varying vec3 c; void main(){ gl_FragColor = vec4(c, alpha); }`));
+  gl.linkProgram(p);
+  // terrain: one textured quad stretched over the terrain extent, drawn behind everything
+  const tp = gl.createProgram();
+  gl.attachShader(tp, sh(gl.VERTEX_SHADER, `attribute vec2 q; uniform vec4 view; uniform vec4 ext; varying vec2 uv;
+    void main(){ vec2 w = ext.xy + q*(ext.zw-ext.xy); uv = vec2(q.x, 1.0-q.y); gl_Position = vec4(w.x*view.x+view.z, w.y*view.y+view.w, 0.999, 1.0); }`));
+  gl.attachShader(tp, sh(gl.FRAGMENT_SHADER, `precision mediump float; uniform sampler2D tex; varying vec2 uv; void main(){ gl_FragColor = texture2D(tex, uv); }`));
+  gl.linkProgram(tp);
+  const quad = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, quad); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
+  return { p, tp, quad, tex: gl.createTexture(), tQ: gl.getAttribLocation(tp, 'q'), tView: gl.getUniformLocation(tp, 'view'), tExt: gl.getUniformLocation(tp, 'ext'),
+    uAlpha: gl.getUniformLocation(p, 'alpha'), pos: gl.createBuffer(), terrain: gl.createBuffer(), islands: gl.createBuffer(), n: 0,
+    aPos: gl.getAttribLocation(p, 'pos'), aCol: gl.getAttribLocation(p, 'col'), uView: gl.getUniformLocation(p, 'view'), uZ: gl.getUniformLocation(p, 'zr') };
+})();
+
+// Height ramp + hillshade so the top view reads like a map: low grass -> dirt -> rock -> pale peaks; steep faces go rocky.
+const RAMP = [[0, [72, 104, 52]], [.3, [104, 134, 66]], [.55, [146, 132, 88]], [.8, [128, 122, 114]], [1, [214, 212, 206]]];
+function ramp(t) {
+  for (let i = 1; i < RAMP.length; i++) if (t <= RAMP[i][0]) {
+    const [t0, a] = RAMP[i - 1], [t1, b] = RAMP[i], k = (t - t0) / (t1 - t0);
+    return a.map((x, j) => x + (b[j] - x) * k);
+  }
+  return RAMP[RAMP.length - 1][1];
+}
+function hsl(h, s, l) { // -> rgb 0..1
+  const a = s * Math.min(l, 1 - l), f = n => { const k = (n + h / 30) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
+  return [f(0), f(8), f(4)];
+}
+function buildMesh() {
+  const m = S.nav, V = m.verts;
+  let zmin = Infinity, zmax = -Infinity;
+  for (let i = 2; i < V.length; i += 3) { zmin = Math.min(zmin, V[i]); zmax = Math.max(zmax, V[i]); }
+  S.zr = [zmin - 1, zmax - zmin + 2];
+  let tris = 0; m.faces.forEach(f => tris += f.v.length - 2);
+  const pos = new Float32Array(tris * 9), ter = new Float32Array(tris * 9), isl = new Float32Array(tris * 9);
+  const L = [-0.45, 0.45, 0.77]; // light from north-west, high
+  let o = 0;
+  m.faces.forEach(f => {
+    const a = f.v[0] * 3, b = f.v[1] * 3, c = f.v[2] * 3;
+    const ux = V[b] - V[a], uy = V[b + 1] - V[a + 1], uz = V[b + 2] - V[a + 2], wx = V[c] - V[a], wy = V[c + 1] - V[a + 1], wz = V[c + 2] - V[a + 2];
+    let nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx; const nl = Math.hypot(nx, ny, nz) || 1;
+    if (nz < 0) { nx = -nx; ny = -ny; nz = -nz; }
+    nx /= nl; ny /= nl; nz /= nl;
+    const shade = 0.6 + 0.5 * Math.max(0, nx * L[0] + ny * L[1] + nz * L[2]);
+    let z = 0; f.v.forEach(v => z += V[v * 3 + 2]); z /= f.v.length;
+    const t = (z - zmin) / (zmax - zmin || 1);
+    const steep = Math.min(1, Math.max(0, (0.85 - nz) / 0.35)); // ~30deg+ slopes blend to rock
+    const rgb = ramp(t).map((x, j) => (x + ([118, 112, 104][j] - x) * steep) * shade / 255);
+    const k = f.island, irgb = hsl(hue(k), k < 2 ? 0.45 : 0.85, 0.3 + t * 0.4).map(x => x * shade);
+    for (let i = 1; i < f.v.length - 1; i++) for (const v of [f.v[0], f.v[i], f.v[i + 1]]) {
+      pos[o] = V[v * 3]; pos[o + 1] = V[v * 3 + 1]; pos[o + 2] = V[v * 3 + 2];
+      ter.set(rgb, o); isl.set(irgb, o); o += 3;
+    }
+  });
+  if (G) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, G.pos); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, G.terrain); gl.bufferData(gl.ARRAY_BUFFER, ter, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, G.islands); gl.bufferData(gl.ARRAY_BUFFER, isl, gl.STATIC_DRAW);
+    G.n = tris * 3;
+  }
+  S.islands.forEach(isl => {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    isl.faces.forEach(i => m.faces[i].v.forEach(v => { const x = V[v * 3], y = V[v * 3 + 1]; x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }));
+    isl.box = [x0, y0, x1, y1];
+  });
+}
+// Entity dot colour from its prefab/name, roughly how things read in the editor's top view.
+const CATS = [[/tree|flora|bush|grass|plant|hedge|ivy|vine/, '#4caf50', 'trees & plants'], [/rock|cliff|stone|boulder|mountain/, '#9e9e9e', 'rocks'], [/water|river|lake|sea|well|fountain/, '#42a5f5', 'water'],
+  [/house|wall|castle|tower|gate|roof|build|keep|church|barn|stair|bridge|tent|hut|shop|inn|tavern|fort/, '#d7a86e', 'buildings'], [/light|torch|fire|lamp|candle/, '#ffb300', 'lights'], [/(?:)/, '#e0e0e0', 'other']];
+const catOf = k => CATS.findIndex(([re]) => re.test(k));
+const shown = e => $('cat' + e.cat).checked;
+function screenPoly(f) { const V = S.nav.verts; ctx.beginPath(); f.v.forEach((v, k) => { const [x, y] = toScreen(V[v * 3], V[v * 3 + 1]); ctx[k ? 'lineTo' : 'moveTo'](x, y); }); ctx.closePath(); }
+
+function draw() {
+  S.dirty = false;
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  if (S.fitBox) applyFit(W, H);
+  for (const c of [cv, glc]) if (c.width !== W * dpr || c.height !== H * dpr) { c.width = W * dpr; c.height = H * dpr; }
+  const { cx, cy, s } = S.view;
+  if (G) {
+    gl.viewport(0, 0, glc.width, glc.height);
+    gl.clearColor(0.086, 0.094, 0.11, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    const kx = 2 * s / W, ky = 2 * s / H;
+    if (S.terrain) {
+      gl.useProgram(G.tp); gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+      gl.uniform4f(G.tView, kx, ky, -cx * kx, -cy * ky); gl.uniform4f(G.tExt, ...S.terrain.extent);
+      gl.bindTexture(gl.TEXTURE_2D, G.tex);
+      gl.bindBuffer(gl.ARRAY_BUFFER, G.quad); gl.enableVertexAttribArray(G.tQ); gl.vertexAttribPointer(G.tQ, 2, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+    if (G.n && $('showNav').checked) {
+      gl.useProgram(G.p);
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); // highest surface wins where navmesh layers overlap
+      // over real terrain the navmesh is a see-through overlay, like the editor's navmesh display
+      if (S.terrain) { gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.uniform1f(G.uAlpha, 0.5); } else { gl.disable(gl.BLEND); gl.uniform1f(G.uAlpha, 1); }
+      gl.uniform4f(G.uView, kx, ky, -cx * kx, -cy * ky); gl.uniform2f(G.uZ, S.zr[0], S.zr[1]);
+      gl.bindBuffer(gl.ARRAY_BUFFER, G.pos); gl.enableVertexAttribArray(G.aPos); gl.vertexAttribPointer(G.aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, S.mode === 'islands' ? G.islands : G.terrain); gl.enableVertexAttribArray(G.aCol); gl.vertexAttribPointer(G.aCol, 3, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, G.n);
+    }
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+  if (S.nav) {
+    if (S.selIsland >= 0) {
+      const isl = S.islands[S.selIsland]; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+      if (isl.faces.length < 3000) isl.faces.forEach(i => { screenPoly(S.nav.faces[i]); ctx.stroke(); });
+      else { const [a, b] = toScreen(isl.box[0], isl.box[3]), [c, d] = toScreen(isl.box[2], isl.box[1]); ctx.strokeRect(a, b, c - a, d - b); }
+    }
+    ctx.lineWidth = 2.5; ctx.strokeStyle = '#f5c542';
+    S.selFaces.forEach(i => { screenPoly(S.nav.faces[i]); ctx.stroke(); });
+    ctx.lineWidth = 1.5; ctx.strokeStyle = '#ff4d4d';
+    if (S.mode === 'islands') S.islands.forEach(isl => {
+      if (isl.faces.length >= SMALL) return;
+      const [x0, y0, x1, y1] = isl.box, [x, y] = toScreen((x0 + x1) / 2, (y0 + y1) / 2);
+      ctx.beginPath(); ctx.arc(x, y, Math.max(6, Math.hypot(x1 - x0, y1 - y0) / 2 * s + 2), 0, 7); ctx.stroke();
+    });
+  }
+  if ($('showEnt').checked) {
+    const q = S.matches, r = s > 2 ? 2 : 1.5;
+    ctx.globalAlpha = q ? 0.15 : 0.85;
+    for (const e of S.ents) { if ((q && q.has(e)) || !shown(e)) continue; const [x, y] = toScreen(e.x, e.y); if (x > -2 && y > -2 && x < W + 2 && y < H + 2) { ctx.fillStyle = e.color; ctx.fillRect(x - r / 2, y - r / 2, r, r); } }
+    ctx.globalAlpha = 1;
+    if (q) { ctx.fillStyle = '#f5c542'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1; for (const e of q) { if (!shown(e)) continue; const [x, y] = toScreen(e.x, e.y); ctx.fillRect(x - 3, y - 3, 6, 6); ctx.strokeRect(x - 3, y - 3, 6, 6); } }
+  }
+}
+const toScreen = (x, y) => [(x - S.view.cx) * S.view.s + cv.clientWidth / 2, (S.view.cy - y) * S.view.s + cv.clientHeight / 2];
+const toWorld = (sx, sy) => [(sx - cv.clientWidth / 2) / S.view.s + S.view.cx, S.view.cy - (sy - cv.clientHeight / 2) / S.view.s];
+const redraw = () => { if (!S.dirty) { S.dirty = true; requestAnimationFrame(draw); } };
+// applied in draw(): the canvas can be 0x0 at load time (hidden tab/pane), which would give scale 0
+function fit(x0, y0, x1, y1) { S.fitBox = [x0, y0, x1, y1]; redraw(); }
+function applyFit(W, H) {
+  const [x0, y0, x1, y1] = S.fitBox; S.fitBox = null;
+  S.view.cx = (x0 + x1) / 2; S.view.cy = (y0 + y1) / 2;
+  S.view.s = Math.min(W / Math.max(x1 - x0, 1), H / Math.max(y1 - y0, 1)) * 0.9;
+}
+function fitAll() {
+  let b = [Infinity, Infinity, -Infinity, -Infinity];
+  const add = (x, y) => { b = [Math.min(b[0], x), Math.min(b[1], y), Math.max(b[2], x), Math.max(b[3], y)]; };
+  if (S.terrain) return fit(...S.terrain.extent);
+  if (S.nav) for (let i = 0; i < S.nav.verts.length; i += 3) add(S.nav.verts[i], S.nav.verts[i + 1]);
+  else S.ents.forEach(e => add(e.x, e.y));
+  if (isFinite(b[0])) fit(...b);
+}
+
+// ---------- side panel ----------
+function listIslands() {
+  const el = $('islands'); el.innerHTML = '';
+  $('islCount').textContent = S.nav ? `(${S.islands.length}, ${S.nav.faces.length} faces)` : '';
+  // smallest first: tiny islands are usually spots where agents get stuck
+  const order = S.islands.map((_, k) => k).reverse();
+  for (const k of order.slice(0, 1000)) {
+    const r = document.createElement('div'); r.className = 'row' + (k === S.selIsland ? ' sel' : '');
+    r.innerHTML = `<span class="sw" style="background:hsl(${hue(k)},${k < 2 ? 35 : 75}%,50%)"></span>Island ${k + 1}<span class="num">${S.islands[k].faces.length} faces</span>`;
+    r.onclick = () => { S.selIsland = k; listIslands(); const b = S.islands[k].box, pad = 5; fit(b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad); };
+    el.appendChild(r);
+  }
+  if (order.length > 1000) el.insertAdjacentHTML('beforeend', `<div class="muted">… ${order.length - 1000} more</div>`);
+}
+function search() {
+  const q = $('q').value.trim().toLowerCase(), el = $('hits'); el.innerHTML = '';
+  S.matches = q ? new Set(S.ents.filter(e => e.key.includes(q))) : null;
+  $('entCount').textContent = S.matches ? `${S.matches.size} / ${S.ents.length}` : `${S.ents.length}`;
+  if (S.matches) for (const e of [...S.matches].slice(0, 300)) {
+    const r = document.createElement('div'); r.className = 'row'; r.title = e.path;
+    r.innerHTML = `${esc(e.label)}<span class="num">${e.x.toFixed(0)}, ${e.y.toFixed(0)}</span>`;
+    r.onclick = () => fit(e.x - 15, e.y - 15, e.x + 15, e.y + 15);
+    el.appendChild(r);
+  }
+  redraw();
+}
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+// ---------- input ----------
+let drag = null;
+cv.onmousedown = e => { drag = { x: e.clientX, y: e.clientY, moved: false }; cv.classList.add('drag'); };
+addEventListener('mouseup', e => {
+  cv.classList.remove('drag');
+  if (drag && !drag.moved && e.target === cv) pick(e.offsetX, e.offsetY);
+  drag = null;
+});
+addEventListener('mousemove', e => {
+  if (drag) {
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true;
+    S.view.cx -= dx / S.view.s; S.view.cy += dy / S.view.s; drag.x = e.clientX; drag.y = e.clientY; redraw();
+  }
+  if (e.target === cv) hover(e.offsetX, e.offsetY); else $('tip').style.display = 'none';
+});
+cv.onwheel = e => {
+  e.preventDefault();
+  const [wx, wy] = toWorld(e.offsetX, e.offsetY), k = Math.exp(-e.deltaY * 0.0015);
+  S.view.s *= k;
+  S.view.cx = wx - (e.offsetX - cv.clientWidth / 2) / S.view.s; S.view.cy = wy + (e.offsetY - cv.clientHeight / 2) / S.view.s;
+  redraw();
+};
+new ResizeObserver(redraw).observe(cv);
+$('q').oninput = search;
+$('showEnt').onchange = redraw;
+document.querySelectorAll('[name=mode]').forEach(r => r.onchange = () => { S.mode = r.value; redraw(); });
+if (!gl) $('status').textContent = 'WebGL is off in this browser: navmesh cannot be drawn.';
+
+function nearestEntity(sx, sy) {
+  if (!$('showEnt').checked) return null;
+  let best = null, bd = 49;
+  for (const e of (S.matches || S.ents)) { if (!shown(e)) continue; const [x, y] = toScreen(e.x, e.y), d = (x - sx) ** 2 + (y - sy) ** 2; if (d < bd) { bd = d; best = e; } }
+  return best;
+}
+function hover(sx, sy) {
+  const e = nearestEntity(sx, sy), tip = $('tip');
+  if (!e) { tip.style.display = 'none'; return; }
+  tip.textContent = `${e.name || '(no name)'}\nprefab: ${e.prefab || '-'}\n${e.x.toFixed(2)}, ${e.y.toFixed(2)}, ${e.z.toFixed(2)}` + (e.path ? `\nin: ${e.path}` : '');
+  tip.style.display = 'block'; tip.style.left = (sx + 12) + 'px'; tip.style.top = (sy + 12) + 'px';
+}
+function inPoly(x, y, f) {
+  const V = S.nav.verts; let inside = false;
+  for (let i = 0, j = f.v.length - 1; i < f.v.length; j = i++) {
+    const xi = V[f.v[i] * 3], yi = V[f.v[i] * 3 + 1], xj = V[f.v[j] * 3], yj = V[f.v[j] * 3 + 1];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+function terrainZ(x, y) {
+  const T = S.terrain; if (!T) return null;
+  const gx = Math.round(x / T.step), gy = Math.round(y / T.step);
+  return gx < 0 || gy < 0 || gx >= T.w || gy >= T.h ? null : T.height[gy * T.w + gx];
+}
+function pick(sx, sy) {
+  const [x, y] = toWorld(sx, sy), tz = terrainZ(x, y);
+  if (!S.nav) { $('info').textContent = `at ${x.toFixed(1)}, ${y.toFixed(1)}` + (tz != null ? `  ground z ${tz.toFixed(1)}` : ''); return; }
+  const V = S.nav.verts;
+  // limitation: linear scan over all faces per click; add a grid if a scene ever makes clicks feel slow
+  S.selFaces = []; S.nav.faces.forEach((f, i) => { if (inPoly(x, y, f)) S.selFaces.push(i); });
+  const zOf = f => f.v.reduce((a, v) => a + V[v * 3 + 2], 0) / f.v.length;
+  S.selFaces.sort((a, b) => zOf(S.nav.faces[b]) - zOf(S.nav.faces[a]));
+  $('info').textContent = `at ${x.toFixed(1)}, ${y.toFixed(1)}` + (tz != null ? `  ground z ${tz.toFixed(1)}` : '') + '\n' + (S.selFaces.length ? S.selFaces.map(i => {
+    const f = S.nav.faces[i];
+    return `face #${i}  id ${f.id}\n  flags ${f.flags}  d ${f.d}  b ${f.b}\n  ${f.v.length} verts  z≈${zOf(f).toFixed(1)}  island ${f.island + 1} (${S.islands[f.island].faces.length} faces)`;
+  }).join('\n') : 'no navmesh face here');
+  $('info').classList.toggle('muted', !S.selFaces.length);
+  redraw();
+}
+
+// ---------- loading ----------
+async function loadFiles(files) {
+  const find = n => files.find(f => f.name.toLowerCase() === n);
+  const nav = find('navmesh.bin'), xs = find('scene.xscene'), ter = find('terrain.bin');
+  const st = $('status'); st.className = 'muted';
+  if (!nav && !xs) { st.textContent = 'No navmesh.bin or scene.xscene in what you picked.'; st.className = 'err'; return; }
+  const folder = ((nav || xs).webkitRelativePath || '').split('/').slice(-2, -1)[0] || '';
+  st.textContent = 'Loading…';
+  const msgs = [];
+  Object.assign(S, { nav: null, islands: [], ents: [], matches: null, selIsland: -1, selFaces: [], terrain: null }); if (G) G.n = 0;
+  try {
+    if (nav) { S.nav = parseNavmesh(await nav.arrayBuffer()); S.islands = findIslands(S.nav); buildMesh(); msgs.push(`${S.nav.faces.length} faces, ${S.islands.length} islands`); }
+    else msgs.push('no navmesh.bin');
+    if (xs) { S.ents = parseScene(await xs.text()); S.ents.forEach(e => { e.cat = catOf(e.key); e.color = CATS[e.cat][1]; }); msgs.push(`${S.ents.length} entities`); }
+    else msgs.push('no scene.xscene');
+    if (ter && S.ents.terrainEl?.getAttribute('enabled') !== 'false' && S.ents.terrainEl) {
+      st.textContent = 'Loading terrain…';
+      S.terrain = await buildTerrain(await ter.arrayBuffer(), S.ents.terrainEl, inflate, S.ents.water);
+      uploadTerrain(S.terrain);
+      msgs.push(`terrain ${S.terrain.extent[2]}x${S.terrain.extent[3]} m`);
+    } else if (ter) msgs.push('terrain needs scene.xscene');
+    st.textContent = (folder ? folder + ': ' : '') + msgs.join(', ');
+  } catch (err) { st.textContent = err.message; st.className = 'err'; console.error(err); }
+  $('drop').style.display = 'none'; $('info').textContent = 'Click a navmesh face.';
+  listIslands(); search(); fitAll();
+}
+$('dir').onchange = e => loadFiles([...e.target.files]);
+const inflate = async z => new Uint8Array(await new Response(new Blob([z]).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer());
+function uploadTerrain(T) {
+  if (!G) return;
+  // shrink by an integer factor if the GPU cannot take a texture this big
+  const max = gl.getParameter(gl.MAX_TEXTURE_SIZE), f = Math.ceil(Math.max(T.w, T.h) / max);
+  let w = T.w, h = T.h, px = T.img;
+  if (f > 1) { w = Math.floor(T.w / f); h = Math.floor(T.h / f); px = new Uint8ClampedArray(w * h * 4); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) px.set(T.img.subarray(((y * f) * T.w + x * f) * 4, ((y * f) * T.w + x * f) * 4 + 4), (y * w + x) * 4); }
+  gl.bindTexture(gl.TEXTURE_2D, G.tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(px.buffer));
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+}
+$('showNav').onchange = redraw;
+// one on/off switch per entity kind (trees & plants, rocks, buildings...)
+$('cats').innerHTML = CATS.map(([, c, n], i) => `<label><input id="cat${i}" type="checkbox" checked> <span class="sw" style="display:inline-block;background:${c}"></span> ${n}</label>`).join('');
+CATS.forEach((_, i) => $('cat' + i).onchange = redraw);
+const main = $('main');
+main.ondragover = e => { e.preventDefault(); main.classList.add('over'); };
+main.ondragleave = () => main.classList.remove('over');
+main.ondrop = async e => {
+  e.preventDefault(); main.classList.remove('over');
+  const entries = [...e.dataTransfer.items].map(i => i.webkitGetAsEntry?.()).filter(Boolean);
+  const files = [];
+  const fileOf = en => new Promise((res, rej) => en.file(res, rej));
+  for (const en of entries) {
+    if (en.isFile) files.push(await fileOf(en));
+    else { // read one folder level; readEntries returns in batches
+      const rd = en.createReader();
+      for (let batch; (batch = await new Promise((r, j) => rd.readEntries(r, j))).length;)
+        for (const c of batch) if (c.isFile) files.push(await fileOf(c));
+    }
+  }
+  loadFiles(files);
+};
+redraw();
+// scene-viewer.exe opens the page with ?scene=1 when a folder was dropped on it; it serves that folder's files under scene/
+if (new URLSearchParams(location.search).has('scene')) (async () => {
+  const files = [];
+  for (const n of ['navmesh.bin', 'scene.xscene', 'terrain.bin']) { const r = await fetch('scene/' + n); if (r.ok) files.push(new File([await r.blob()], n)); }
+  loadFiles(files);
+})();
+</script>
+</body>
+</html>
